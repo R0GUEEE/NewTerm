@@ -10,9 +10,12 @@ import UIKit
 import os.log
 import CoreServices
 import SwiftUIX
+import SwiftTerm
 import NewTermCommon
 
 class TerminalSessionViewController: BaseTerminalSplitViewControllerChild {
+
+    var keyboardToolbarHeightChanged: ((Double) -> Void)?
 
 	var initialCommand: String?
 
@@ -29,10 +32,23 @@ class TerminalSessionViewController: BaseTerminalSplitViewControllerChild {
 
 	private var terminalController = TerminalController()
 	private var keyInput = TerminalKeyInput(frame: .zero)
-	private var textView: TerminalHostingView!
+    private var textView: UIView!
+    private var tableView: UITableView!
 	private var textViewTapGestureRecognizer: UITapGestureRecognizer!
+	private var panGestureRecognizer: UIPanGestureRecognizer!
+	private var pinchGestureRecognizer: UIPinchGestureRecognizer!
+	private var longPressGestureRecognizer: UILongPressGestureRecognizer!
 
+	// Touch integration state
+	private var panStartPoint: CGPoint = .zero
+	private var panAccumulatedX: CGFloat = 0
+	private var panAccumulatedY: CGFloat = 0
+	private var pinchStartFontSize: Double = 12
+	private let panThreshold: CGFloat = 16
+    
 	private var state = TerminalState()
+    private var lines = [BufferLine]()
+    private var cursor = (x:Int(-1), y:Int(-1))
 
 	private var hudState = HUDViewState()
 	private var hudView: UIHostingView<AnyView>!
@@ -69,15 +85,45 @@ class TerminalSessionViewController: BaseTerminalSplitViewControllerChild {
 		title = .localize("TERMINAL", comment: "Generic title displayed before the terminal sets a proper title.")
 
 		preferencesUpdated()
-		textView = TerminalHostingView(state: state)
+        
+        tableView = UITableView()
+        tableView.delegate = self
+        tableView.dataSource = self
+        tableView.separatorStyle = .none
+        tableView.separatorInset = .zero
+        tableView.backgroundColor = .clear
+        
+//        textView = TerminalHostingView(state: state)
+        textView = tableView
 
 		textViewTapGestureRecognizer = UITapGestureRecognizer(target: self, action: #selector(self.handleTextViewTap(_:)))
 		textViewTapGestureRecognizer.delegate = self
 		textView.addGestureRecognizer(textViewTapGestureRecognizer)
 
+		// Two-finger pan → send arrow key sequences (trackpad-style navigation)
+		panGestureRecognizer = UIPanGestureRecognizer(target: self, action: #selector(self.handlePanGesture(_:)))
+		panGestureRecognizer.minimumNumberOfTouches = 2
+		panGestureRecognizer.maximumNumberOfTouches = 2
+		panGestureRecognizer.delegate = self
+		textView.addGestureRecognizer(panGestureRecognizer)
+
+		// Pinch → adjust font size
+		pinchGestureRecognizer = UIPinchGestureRecognizer(target: self, action: #selector(self.handlePinchGesture(_:)))
+		pinchGestureRecognizer.delegate = self
+		textView.addGestureRecognizer(pinchGestureRecognizer)
+
+		// Long press → copy terminal contents to pasteboard
+		longPressGestureRecognizer = UILongPressGestureRecognizer(target: self, action: #selector(self.handleLongPressGesture(_:)))
+		longPressGestureRecognizer.minimumPressDuration = 0.5
+		longPressGestureRecognizer.delegate = self
+		textView.addGestureRecognizer(longPressGestureRecognizer)
+
 		keyInput.frame = view.bounds
 		keyInput.autoresizingMask = [.flexibleWidth, .flexibleHeight]
 		keyInput.textView = textView
+        keyInput.keyboardToolbarHeightChanged = { height in
+            self.keyboardToolbarHeightChanged?(height)
+        }
 		keyInput.terminalInputDelegate = terminalController
 		view.addSubview(keyInput)
 	}
@@ -111,7 +157,7 @@ class TerminalSessionViewController: BaseTerminalSplitViewControllerChild {
 															 image: UIImage(systemName: "key.fill"),
 															 action: #selector(self.activatePasswordManager),
 															 input: "f",
-															 modifierFlags: [ .command, .alternate ]))
+															 modifierFlags: [ .command ]))
 		#endif
 
 		if UIApplication.shared.supportsMultipleScenes {
@@ -157,20 +203,41 @@ class TerminalSessionViewController: BaseTerminalSplitViewControllerChild {
 
 		hasAppeared = false
 	}
-
+    
+    override func viewWillTransition(to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator) {
+        NSLog("NewTermLog: viewWillTransition to \(size)")
+        super.viewWillTransition(to: size, with: coordinator)
+        if UIDevice.current.userInterfaceIdiom == .pad {
+            if keyInput.isFirstResponder {
+                //reload keyboardToolbar
+                keyInput.resignFirstResponder()
+            }
+        }
+    }
+    
 	override func viewWillLayoutSubviews() {
+        NSLog("NewTermLog: TerminalSessionViewController.viewWillLayoutSubviews \(self.view.frame) \(self.view.safeAreaInsets)")
 		super.viewWillLayoutSubviews()
 		updateScreenSize()
 	}
+    
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        NSLog("NewTermLog: TerminalSessionViewController.viewDidLayoutSubviews \(self.view.frame) \(self.view.safeAreaInsets)")
+        NSLog("NewTermLog: textView frame=\(self.textView.frame) safeArea=\(self.textView.safeAreaInsets)")
+//        updateScreenSize()
+    }
 
 	override func viewSafeAreaInsetsDidChange() {
+        NSLog("NewTermLog: TerminalSessionViewController.viewSafeAreaInsetsDidChange \(self.view.frame) \(view.safeAreaInsets)")
 		super.viewSafeAreaInsetsDidChange()
-		updateScreenSize()
+//		updateScreenSize()
 	}
 
 	override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
+        NSLog("NewTermLog: TerminalSessionViewController.traitCollectionDidChange \(self.view.frame) \(view.safeAreaInsets)")
 		super.traitCollectionDidChange(previousTraitCollection)
-		updateScreenSize()
+//		updateScreenSize()
 	}
 
 	override func removeFromParent() {
@@ -193,20 +260,32 @@ class TerminalSessionViewController: BaseTerminalSplitViewControllerChild {
 		}
 
 		// Determine the screen size based on the font size
-		var layoutSize = textView.safeAreaLayoutGuide.layoutFrame.size
+        var layoutSize = self.view.safeAreaLayoutGuide.layoutFrame.size
 		layoutSize.width -= TerminalView.horizontalSpacing * 2
 		layoutSize.height -= TerminalView.verticalSpacing * 2
 
-		if layoutSize.width < 0 || layoutSize.height < 0 {
+		if layoutSize.width <= 0 || layoutSize.height <= 0 {
 			// Not laid out yet. We’ll be called again when we are.
 			return
 		}
+        
+        let layoutFrame1 = self.view.safeAreaLayoutGuide.layoutFrame
+        if layoutFrame1.origin.x < 0 || layoutFrame1.origin.y < 0 {
+            //in layouting
+            return
+        }
+        let layoutFrame2 = self.textView.safeAreaLayoutGuide.layoutFrame
+        if layoutFrame2.origin.x < 0 || layoutFrame2.origin.y < 0 {
+            //in layouting
+            return
+        }
 
 		let glyphSize = terminalController.fontMetrics.boundingBox
 		if glyphSize.width == 0 || glyphSize.height == 0 {
 			fatalError("Failed to get glyph size")
 		}
-
+        
+        NSLog("NewTermLog: TerminalSessionViewController.updateScreenSize self=\(self.view.safeAreaLayoutGuide.layoutFrame) textView=\(textView.safeAreaLayoutGuide.layoutFrame)")
 		let newSize = ScreenSize(cols: UInt16(layoutSize.width / glyphSize.width),
 														 rows: UInt16(layoutSize.height / glyphSize.height.rounded(.up)),
 														 cellSize: glyphSize)
@@ -214,6 +293,10 @@ class TerminalSessionViewController: BaseTerminalSplitViewControllerChild {
 			screenSize = newSize
 			delegate?.terminal(viewController: self, screenSizeDidChange: newSize)
 		}
+        else {
+            //when layout size changes, always scroll even if rows/columns don't change
+            self.scroll(animated: true)
+        }
 	}
 
 	@objc func clearTerminal() {
@@ -221,6 +304,7 @@ class TerminalSessionViewController: BaseTerminalSplitViewControllerChild {
 	}
 
 	private func updateIsSplitViewResizing() {
+        NSLog("NewTermLog: TerminalSessionViewController.updateIsSplitViewResizing")
 		state.isSplitViewResizing = isSplitViewResizing
 
 		if !isSplitViewResizing {
@@ -229,6 +313,7 @@ class TerminalSessionViewController: BaseTerminalSplitViewControllerChild {
 	}
 
 	private func updateShowsTitleView() {
+        NSLog("NewTermLog: TerminalSessionViewController.updateShowsTitleView")
 		updateScreenSize()
 	}
 
@@ -238,6 +323,87 @@ class TerminalSessionViewController: BaseTerminalSplitViewControllerChild {
 		if gestureRecognizer.state == .ended && !keyInput.isFirstResponder {
 			keyInput.becomeFirstResponder()
 			delegate?.terminalDidBecomeActive(viewController: self)
+		}
+	}
+
+	// MARK: - Touch Gesture Handlers
+
+	/// Two-finger pan: sends arrow key escape sequences for cursor movement.
+	/// Accumulates fractional movement so fast swipes send multiple keys.
+	@objc private func handlePanGesture(_ recognizer: UIPanGestureRecognizer) {
+		switch recognizer.state {
+		case .began:
+			panAccumulatedX = 0
+			panAccumulatedY = 0
+
+		case .changed:
+			let delta = recognizer.translation(in: textView)
+			recognizer.setTranslation(.zero, in: textView)
+
+			panAccumulatedX += delta.x
+			panAccumulatedY += delta.y
+
+			// Horizontal axis
+			while panAccumulatedX <= -panThreshold {
+				terminalController.receiveKeyboardInput(data: EscapeSequences.left)
+				panAccumulatedX += panThreshold
+			}
+			while panAccumulatedX >= panThreshold {
+				terminalController.receiveKeyboardInput(data: EscapeSequences.right)
+				panAccumulatedX -= panThreshold
+			}
+
+			// Vertical axis
+			while panAccumulatedY <= -panThreshold {
+				terminalController.receiveKeyboardInput(data: EscapeSequences.up)
+				panAccumulatedY += panThreshold
+			}
+			while panAccumulatedY >= panThreshold {
+				terminalController.receiveKeyboardInput(data: EscapeSequences.down)
+				panAccumulatedY -= panThreshold
+			}
+
+		default:
+			panAccumulatedX = 0
+			panAccumulatedY = 0
+		}
+	}
+
+	/// Pinch gesture: scales the terminal font size between 8 and 24pt.
+	@objc private func handlePinchGesture(_ recognizer: UIPinchGestureRecognizer) {
+		switch recognizer.state {
+		case .began:
+			pinchStartFontSize = Preferences.shared.fontSize
+
+		case .changed:
+			let rawSize = pinchStartFontSize * Double(recognizer.scale)
+			let clampedSize = min(max(rawSize, 8), 24)
+			// Round to nearest 0.5 to avoid jitter
+			let rounded = (clampedSize * 2).rounded() / 2
+			if rounded != Preferences.shared.fontSize {
+				Preferences.shared.fontSize = rounded
+			}
+
+		default:
+			break
+		}
+	}
+
+	/// Long press: copies visible terminal buffer to the system pasteboard and
+	/// briefly shows a HUD-style toast using an alert (non-intrusive).
+	@objc private func handleLongPressGesture(_ recognizer: UILongPressGestureRecognizer) {
+		guard recognizer.state == .began else { return }
+		if let text = terminalController.getAllText() {
+			UIPasteboard.general.string = text
+			HapticController.playBell()
+			// Momentary feedback via alert that auto-dismisses
+			let alert = UIAlertController(title: nil,
+			                              message: "Terminal output copied",
+			                              preferredStyle: .alert)
+			present(alert, animated: true)
+			DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+				self?.dismiss(animated: true)
+			}
 		}
 	}
 
@@ -259,14 +425,33 @@ class TerminalSessionViewController: BaseTerminalSplitViewControllerChild {
 		state.fontMetrics = terminalController.fontMetrics
 		state.colorMap = terminalController.colorMap
 	}
-
 }
 
 extension TerminalSessionViewController: TerminalControllerDelegate {
 
-	func refresh(lines: inout [AnyView]) {
-		state.lines = lines
+    func refresh(lines: inout [AnyView]) {
+        state.lines = lines
+        self.scroll()
+    }
+    
+    func refresh(lines: inout [BufferLine], cursor: (Int,Int)) {
+        NSLog("NewTermLog: refresh lines=\(lines.count)")
+        self.lines = lines
+        self.cursor = cursor
+        self.tableView.reloadData()
+        self.scroll()
 	}
+    
+    func scroll(animated: Bool = false) {
+        state.scroll += 1
+        
+        let lastRow = self.tableView.numberOfRows(inSection: 0) - 1
+        if lastRow >= 0 {
+            let indexPath = IndexPath(row: lastRow, section: 0)
+            self.tableView.scrollToRow(at: indexPath, at: .bottom, animated: false)
+            NSLog("NewTermLog: scrollToRow \(indexPath)")
+        }
+    }
 
 	func activateBell() {
 		if Preferences.shared.bellHUD {
@@ -340,6 +525,20 @@ extension TerminalSessionViewController: UIGestureRecognizerDelegate {
 		return gestureRecognizer == textViewTapGestureRecognizer
 			&& (!(otherGestureRecognizer is UITapGestureRecognizer) || keyInput.isFirstResponder)
 	}
+
+
+	func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+	                        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+		// Allow pinch and two-finger pan to coexist with each other and with the table view's
+		// built-in scroll gesture. The pan recognizer requires 2 touches, so it won't fire during
+		// normal single-finger scrolling of the UITableView.
+		let touchGestures: [UIGestureRecognizer?] = [panGestureRecognizer, pinchGestureRecognizer, longPressGestureRecognizer]
+		if touchGestures.contains(where: { $0 === gestureRecognizer }) ||
+		   touchGestures.contains(where: { $0 === otherGestureRecognizer }) {
+			return true
+		}
+		return false
+	}
 }
 
 extension TerminalSessionViewController: UIDocumentPickerDelegate {
@@ -364,4 +563,44 @@ extension TerminalSessionViewController: UIDocumentPickerDelegate {
 		}
 	}
 
+}
+
+class SwiftUITableViewCell: UITableViewCell {
+    func configure(with view: AnyView) {
+        let hostingView = UIHostingView(rootView: view)
+        hostingView.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(hostingView)
+        NSLayoutConstraint.activate([
+            hostingView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+//            hostingView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            hostingView.topAnchor.constraint(equalTo: contentView.topAnchor),
+            hostingView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor)
+        ])
+        
+        self.backgroundColor = .clear
+        contentView.backgroundColor = .clear
+        hostingView.backgroundColor = .clear
+    }
+}
+
+extension TerminalSessionViewController: UITableViewDelegate {
+    func tableView(_ tableView: UITableView, willSelectRowAt indexPath: IndexPath) -> IndexPath? {
+        return nil
+    }
+}
+
+extension TerminalSessionViewController: UITableViewDataSource {
+
+    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+        self.lines.count
+    }
+    
+    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        let cell = SwiftUITableViewCell()
+        let line = self.lines[indexPath.row]
+        let view = terminalController.stringSupplier.attributedString(line: line, cursorX: indexPath.row==cursor.y ? cursor.x : -1)
+        cell.configure(with: view)
+        return cell
+    }
+    
 }
