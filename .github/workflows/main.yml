@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    paths-ignore:
+      - '.gitignore'
+      - '**/*.md'
+      - 'assets/**'
+  pull_request:
+    paths-ignore:
+      - '.gitignore'
+      - '**/*.md'
+      - 'assets/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build (rootless)
+    runs-on: macos-13
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Procursus (ldid + build tools)
+        uses: beerpiss/procursus-action@v2
+        with:
+          packages: ldid xz-utils cmark make
+          cache: true
+          cache-path: ~/__cache
+
+      - name: Set up Theos
+        run: |
+          git clone --recursive --depth=1 \
+            'https://github.com/theos/theos.git' ~/theos
+
+      - name: Build rootless package
+        id: package_build
+        env:
+          THEOS: ~/theos
+          ROOTLESS: 1
+          # Use ldid for codesigning instead of Apple-issued certs
+          CODESIGN_FLAGS: ""
+        run: |
+          # Verify ldid is available
+          which ldid || (echo "ldid not found" && exit 1)
+
+          gmake package \
+            THEOS=~/theos \
+            ROOTLESS=1 \
+            FINALPACKAGE=1 \
+            STRIP=1
+
+          PKG=$(cat .theos/last_package)
+          echo "package=$PKG" >> "$GITHUB_OUTPUT"
+          echo "package_name=$(basename $PKG)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NewTerm3-rootless
+          path: ${{ steps.package_build.outputs.package }}
+          if-no-files-found: error
+          retention-days: 30
