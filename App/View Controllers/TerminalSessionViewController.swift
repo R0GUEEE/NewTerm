@@ -443,8 +443,6 @@ extension TerminalSessionViewController: TerminalControllerDelegate {
 	}
     
     func scroll(animated: Bool = false) {
-        state.scroll += 1
-        
         let lastRow = self.tableView.numberOfRows(inSection: 0) - 1
         if lastRow >= 0 {
             let indexPath = IndexPath(row: lastRow, section: 0)
